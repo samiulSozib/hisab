@@ -1,0 +1,427 @@
+// Hisab — Personal Finance Management
+// Prisma schema (PostgreSQL / Neon)
+//
+// Conventions
+// - Every monetary value is NUMERIC(18,2). Never use Float for money.
+// - Interest rates are NUMERIC(9,4) and expressed as an ANNUAL percentage (e.g. 9.5000 = 9.5% p.a.).
+// - Financial dates (transaction date, due date, ...) are DATE columns (no time zone ambiguity).
+// - Every user-owned table carries `userId` and is indexed by it. Ownership is enforced in the
+//   service layer (src/server/services) on every read and write.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ───────────────────────────── Enums ─────────────────────────────
+
+enum AccountType {
+  CASH
+  BANK
+  BKASH
+  NAGAD
+  ROCKET
+  SAVINGS
+  CREDIT_CARD
+  OTHER
+}
+
+enum CategoryKind {
+  INCOME
+  EXPENSE
+}
+
+/// Business meaning of a ledger entry.
+enum TransactionType {
+  INCOME
+  EXPENSE
+  TRANSFER
+  LOAN_RECEIVED // borrowed principal received (personal / bank / EMI financing)
+  LOAN_GIVEN // money lent to someone
+  LOAN_REPAYMENT // repayment of a borrowed personal or bank loan
+  LOAN_COLLECTION // repayment received for money lent
+  EMI_PAYMENT // installment paid on an EMI loan
+  OPENING_BALANCE
+  ADJUSTMENT
+}
+
+/// Cash-flow effect of a ledger entry on `accountId` (and `toAccountId` for transfers).
+enum TransactionDirection {
+  INFLOW
+  OUTFLOW
+  TRANSFER
+}
+
+enum LoanKind {
+  PERSONAL
+  EMI
+  BANK
+}
+
+enum LoanDirection {
+  BORROWED
+  LENT
+}
+
+enum LoanStatus {
+  ACTIVE
+  CLOSED
+  DEFAULTED
+}
+
+enum InstallmentStatus {
+  PENDING
+  PARTIAL
+  PAID
+  MISSED
+  WAIVED
+}
+
+enum PaymentFrequency {
+  WEEKLY
+  BIWEEKLY
+  MONTHLY
+  QUARTERLY
+  YEARLY
+}
+
+enum InterestMethod {
+  NONE // interest-free
+  REDUCING_BALANCE // standard amortizing EMI
+  FLAT_RATE // interest computed on original principal for the whole term
+  SIMPLE // simple interest, manual principal/interest split (personal loans)
+}
+
+enum RecurringFrequency {
+  DAILY
+  WEEKLY
+  MONTHLY
+  QUARTERLY
+  YEARLY
+}
+
+enum TokenType {
+  EMAIL_VERIFICATION
+  PASSWORD_RESET
+}
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+}
+
+// ───────────────────────────── Identity ─────────────────────────────
+
+model User {
+  id                  String    @id @default(cuid())
+  name                String
+  email               String    @unique
+  emailVerified       DateTime?
+  passwordHash        String
+  currency            String    @default("BDT")
+  timezone            String    @default("Asia/Dhaka")
+  /// Incremented on password change / "sign out everywhere" to invalidate existing JWT sessions.
+  sessionVersion      Int       @default(0)
+  failedLoginAttempts Int       @default(0)
+  lockedUntil         DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  tokens       AuthToken[]
+  accounts     Account[]
+  categories   Category[]
+  transactions Transaction[]
+  loans        Loan[]
+  installments LoanInstallment[]
+  loanPayments LoanPayment[]
+  recurring    RecurringTransaction[]
+  attachments  Attachment[]
+  auditLogs    AuditLog[]
+}
+
+/// Single-use tokens for email verification and password reset. Only a SHA-256 hash is stored.
+model AuthToken {
+  id        String    @id @default(cuid())
+  userId    String
+  type      TokenType
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type])
+}
+
+// ───────────────────────────── Ledger ─────────────────────────────
+
+model Account {
+  id                String      @id @default(cuid())
+  userId            String
+  name              String
+  type              AccountType
+  institution       String?
+  description       String?
+  color             String?
+  openingBalance    Decimal     @default(0) @db.Decimal(18, 2)
+  /// Denormalised running balance. Always updated in the same DB transaction as the ledger entry.
+  currentBalance    Decimal     @default(0) @db.Decimal(18, 2)
+  openingDate       DateTime    @db.Date
+  includeInNetWorth Boolean     @default(true)
+  isArchived        Boolean     @default(false)
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  user                 User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions         Transaction[]          @relation("TransactionAccount")
+  incomingTransfers    Transaction[]          @relation("TransactionToAccount")
+  loans                Loan[]
+  recurringTransactions RecurringTransaction[]
+
+  @@unique([userId, name])
+  @@index([userId, isArchived])
+}
+
+model Category {
+  id         String       @id @default(cuid())
+  userId     String
+  name       String
+  kind       CategoryKind
+  color      String?
+  icon       String?
+  isArchived Boolean      @default(false)
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+
+  user         User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions Transaction[]
+  recurring    RecurringTransaction[]
+  loans        Loan[]
+
+  @@unique([userId, kind, name])
+  @@index([userId, kind])
+}
+
+model Transaction {
+  id           String               @id @default(cuid())
+  userId       String
+  type         TransactionType
+  direction    TransactionDirection
+  /// Always positive. The sign is derived from `direction`.
+  amount       Decimal              @db.Decimal(18, 2)
+  date         DateTime             @db.Date
+  accountId    String
+  /// Destination account (transfers only).
+  toAccountId  String?
+  categoryId   String?
+  loanId       String?
+  recurringId  String?
+  /// Payer / payee / employer / merchant.
+  counterparty String?
+  reference    String?
+  description  String?
+  createdAt    DateTime             @default(now())
+  updatedAt    DateTime             @updatedAt
+
+  user        User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  account     Account               @relation("TransactionAccount", fields: [accountId], references: [id], onDelete: Restrict)
+  toAccount   Account?              @relation("TransactionToAccount", fields: [toAccountId], references: [id], onDelete: Restrict)
+  category    Category?             @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  loan        Loan?                 @relation(fields: [loanId], references: [id], onDelete: Cascade)
+  recurring   RecurringTransaction? @relation(fields: [recurringId], references: [id], onDelete: SetNull)
+  loanPayment LoanPayment?
+  attachments Attachment[]
+
+  @@index([userId, date])
+  @@index([userId, type, date])
+  @@index([userId, categoryId, date])
+  @@index([accountId, date])
+  @@index([toAccountId])
+  @@index([loanId])
+}
+
+// ───────────────────────────── Loans ─────────────────────────────
+
+model Loan {
+  id                   String            @id @default(cuid())
+  userId               String
+  kind                 LoanKind
+  direction            LoanDirection     @default(BORROWED)
+  status               LoanStatus        @default(ACTIVE)
+  title                String
+  /// Person name (personal), merchant / lender (EMI) or bank name (bank).
+  counterparty         String
+  /// Principal borrowed / lent / financed.
+  principal            Decimal           @db.Decimal(18, 2)
+  interestRate         Decimal           @default(0) @db.Decimal(9, 4)
+  interestMethod       InterestMethod    @default(NONE)
+  frequency            PaymentFrequency?
+  installmentCount     Int?
+  installmentAmount    Decimal?          @db.Decimal(18, 2)
+  startDate            DateTime          @db.Date
+  firstPaymentDate     DateTime?         @db.Date
+  dueDate              DateTime?         @db.Date
+  finalPaymentDate     DateTime?         @db.Date
+  accountId            String
+  repaymentTerms       String?
+  description          String?
+
+  // EMI purchase details
+  purchasePrice        Decimal?          @db.Decimal(18, 2)
+  downPayment          Decimal?          @db.Decimal(18, 2)
+  purchaseCategoryId   String?
+
+  // Bank loan details
+  loanType             String?
+  referenceNumber      String?
+  termMonths           Int?
+  processingFee        Decimal?          @db.Decimal(18, 2)
+
+  // Running totals, maintained transactionally with every payment.
+  principalRepaid      Decimal           @default(0) @db.Decimal(18, 2)
+  interestPaid         Decimal           @default(0) @db.Decimal(18, 2)
+  feesPaid             Decimal           @default(0) @db.Decimal(18, 2)
+  outstandingPrincipal Decimal           @db.Decimal(18, 2)
+  closedAt             DateTime?
+  createdAt            DateTime          @default(now())
+  updatedAt            DateTime          @updatedAt
+
+  user             User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  account          Account           @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  purchaseCategory Category?         @relation(fields: [purchaseCategoryId], references: [id], onDelete: SetNull)
+  installments     LoanInstallment[]
+  payments         LoanPayment[]
+  transactions     Transaction[]
+  attachments      Attachment[]
+
+  @@index([userId, kind, status])
+  @@index([userId, status])
+}
+
+model LoanInstallment {
+  id                 String            @id @default(cuid())
+  loanId             String
+  userId             String
+  number             Int
+  dueDate            DateTime          @db.Date
+  scheduledAmount    Decimal           @db.Decimal(18, 2)
+  scheduledPrincipal Decimal           @db.Decimal(18, 2)
+  scheduledInterest  Decimal           @db.Decimal(18, 2)
+  openingBalance     Decimal           @db.Decimal(18, 2)
+  closingBalance     Decimal           @db.Decimal(18, 2)
+  paidAmount         Decimal           @default(0) @db.Decimal(18, 2)
+  principalPaid      Decimal           @default(0) @db.Decimal(18, 2)
+  interestPaid       Decimal           @default(0) @db.Decimal(18, 2)
+  feesPaid           Decimal           @default(0) @db.Decimal(18, 2)
+  lastPaymentDate    DateTime?         @db.Date
+  status             InstallmentStatus @default(PENDING)
+  notes              String?
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
+
+  loan     Loan          @relation(fields: [loanId], references: [id], onDelete: Cascade)
+  user     User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  payments LoanPayment[]
+
+  @@unique([loanId, number])
+  @@index([userId, status, dueDate])
+  @@index([loanId, status])
+}
+
+/// A repayment (borrowed) or collection (lent). Always linked 1:1 to a ledger Transaction.
+model LoanPayment {
+  id              String   @id @default(cuid())
+  userId          String
+  loanId          String
+  installmentId   String?
+  transactionId   String   @unique
+  date            DateTime @db.Date
+  amount          Decimal  @db.Decimal(18, 2)
+  principalAmount Decimal  @db.Decimal(18, 2)
+  interestAmount  Decimal  @db.Decimal(18, 2)
+  feeAmount       Decimal  @default(0) @db.Decimal(18, 2)
+  notes           String?
+  createdAt       DateTime @default(now())
+
+  user        User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  loan        Loan             @relation(fields: [loanId], references: [id], onDelete: Cascade)
+  installment LoanInstallment? @relation(fields: [installmentId], references: [id], onDelete: SetNull)
+  transaction Transaction      @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+
+  @@index([loanId, date])
+  @@index([userId, date])
+}
+
+// ───────────────────────────── Automation & files ─────────────────────────────
+
+model RecurringTransaction {
+  id           String             @id @default(cuid())
+  userId       String
+  type         TransactionType // INCOME or EXPENSE
+  amount       Decimal            @db.Decimal(18, 2)
+  accountId    String
+  categoryId   String?
+  counterparty String?
+  description  String?
+  frequency    RecurringFrequency
+  interval     Int                @default(1)
+  startDate    DateTime           @db.Date
+  nextRunDate  DateTime           @db.Date
+  endDate      DateTime?          @db.Date
+  isActive     Boolean            @default(true)
+  lastRunAt    DateTime?
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  account      Account       @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  category     Category?     @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  transactions Transaction[]
+
+  @@index([userId, isActive])
+  @@index([isActive, nextRunDate])
+}
+
+/// Receipts and supporting documents. Bytes are stored in Postgres (max 4 MB, validated by magic bytes)
+/// and are only ever served through an authenticated, ownership-checked route.
+model Attachment {
+  id            String   @id @default(cuid())
+  userId        String
+  transactionId String?
+  loanId        String?
+  fileName      String
+  mimeType      String
+  size          Int
+  data          Bytes
+  createdAt     DateTime @default(now())
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transaction Transaction? @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  loan        Loan?        @relation(fields: [loanId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([transactionId])
+  @@index([loanId])
+}
+
+model AuditLog {
+  id         String      @id @default(cuid())
+  userId     String
+  action     AuditAction
+  entityType String
+  entityId   String
+  summary    String
+  changes    Json?
+  createdAt  DateTime    @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([entityType, entityId])
+}
