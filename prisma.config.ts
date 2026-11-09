@@ -10,6 +10,7 @@ export default defineConfig({
     seed: "tsx --conditions=react-server prisma/seed.ts",
   },
   datasource: {
-    url: process.env.DIRECT_URL ?? process.env.DATABASE_URL ?? "",
+    // DIRECT_URL (manual setup) or DATABASE_URL_UNPOOLED (injected by the Vercel ↔ Neon integration).
+    url: process.env.DIRECT_URL ?? process.env.DATABASE_URL_UNPOOLED ?? process.env.DATABASE_URL ?? "",
   },
 });
